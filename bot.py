@@ -102,70 +102,72 @@ async def process_video_with_peephole_effect(input_path):
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(temp_output_path, fourcc, fps, (width, height))
 
-        # Get dimensions for a perfect circle
-        size = min(width, height)
-        center_x = width // 2
-        center_y = height // 2
-        radius = size // 2
-
-        # Create circle mask with gradient edges
+        # Create circle mask and vignette mask
         mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+        cv2.circle(mask, (width // 2, height // 2), width // 2, 255, -1)
 
         # Create a softer edge mask for vignette effect
         vignette_mask = np.zeros((height, width), dtype=np.float32)
-        cv2.circle(vignette_mask, (center_x, center_y), radius, 1.0, -1)
+        cv2.circle(vignette_mask, (width // 2, height // 2), width // 2, 1.0, -1)
         # Blur the edges to create gradient
         vignette_mask = cv2.GaussianBlur(
-            vignette_mask, (radius // 2 + 1, radius // 2 + 1), 0
+            vignette_mask, (width // 10 + 1, width // 10 + 1), 0
         )
 
-        # Create distortion maps for lens effect
-        distortion_strength = 0.8  # Adjust this for more/less distortion
+        # Create maps for the lens effect
         map_x = np.zeros((height, width), np.float32)
         map_y = np.zeros((height, width), np.float32)
 
+        center_x = width // 2
+        center_y = height // 2
+        center_radius = width * 0.4  # 40% of the input size will be preserved exactly
+
+        # Pre-fill the maps with identity transform (no effect)
         for y in range(height):
             for x in range(width):
-                # Calculate normalized coordinates from center
-                dx = (x - center_x) / radius
-                dy = (y - center_y) / radius
-                r = np.sqrt(dx * dx + dy * dy)
+                map_x[y, x] = x
+                map_y[y, x] = y
 
-                if r <= 1.0:
-                    threshold = 0.7  # Only distort outer 30% of the circle
-                    if r < threshold:
-                        r_distorted = r
-                    else:
-                        # Smooth transition with exponential curve
-                        t = (r - threshold) / (1 - threshold)
-                        r_distorted = r * (1 + distortion_strength * (t**3))
+        # Apply lens effect only where needed
+        for y in range(height):
+            for x in range(width):
+                # Calculate distance from center (in pixels)
+                dx = x - center_x
+                dy = y - center_y
+                r_pixels = np.sqrt(dx * dx + dy * dy)
 
-                    if r != 0:
-                        dx_distorted = dx * r_distorted / r
-                        dy_distorted = dy * r_distorted / r
-                    else:
-                        dx_distorted, dy_distorted = 0, 0
+                # Skip center region - we want to preserve it exactly
+                if r_pixels <= center_radius:
+                    continue
 
-                    map_x[y, x] = center_x + dx_distorted * radius
-                    map_y[y, x] = center_y + dy_distorted * radius
-                else:
-                    map_x[y, x] = x
-                    map_y[y, x] = y
+                # Calculate normalized radius (0-1 scale where 1 is edge of circle)
+                r = r_pixels / (width / 2)
 
-        # Modify compensation calculation to preserve original scale
-        valid_pixels = mask > 0
-        min_map_x = np.min(map_x[valid_pixels])
-        max_map_x = np.max(map_x[valid_pixels])
-        min_map_y = np.min(map_y[valid_pixels])
-        max_map_y = np.max(map_y[valid_pixels])
+                if r >= 1.0:
+                    # Outside the circle - no need to process
+                    continue
 
-        # Calculate needed compensation but apply only partial scaling
-        comp_factor_x = width / (max_map_x - min_map_x)
-        comp_factor_y = height / (max_map_y - min_map_y)
-        compensation_factor = 1
-        map_x = center_x + (map_x - center_x) * compensation_factor
-        map_y = center_y + (map_y - center_y) * compensation_factor
+                # Calculate angle - we'll preserve this exactly
+                theta = np.arctan2(dy, dx)
+
+                # Apply lens effect - edges only
+                # Calculate how far we are into the edge region
+                edge_t = (r_pixels - center_radius) / (width / 2 - center_radius)
+                edge_t = min(1.0, edge_t)  # Cap at 1.0
+
+                # More subtle lens effect - reduced strength
+                lens_strength = 0.3 * edge_t**3
+
+                # New radius after lens effect (compression toward center)
+                r_new = r_pixels * (1.0 - lens_strength * edge_t)
+
+                # Convert back to cartesian coordinates while preserving angle
+                new_x = center_x + r_new * np.cos(theta)
+                new_y = center_y + r_new * np.sin(theta)
+
+                # Here we're doing the inverse mapping - which pixel in source maps to destination
+                map_x[y, x] = new_x
+                map_y[y, x] = new_y
 
         # Create a background for areas outside the circle
         background = np.zeros((height, width, 3), dtype=np.uint8)
@@ -176,12 +178,16 @@ async def process_video_with_peephole_effect(input_path):
             if not ret:
                 break
 
+            # Apply the mapping (lens effect)
             distorted = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR)
+
+            # Apply circular mask and vignette
             masked_frame = cv2.bitwise_and(distorted, distorted, mask=mask)
             vignette = masked_frame.copy()
             for c in range(3):
                 vignette[:, :, c] = vignette[:, :, c] * vignette_mask
 
+            # Combine with background
             result_frame = background.copy()
             result_frame = cv2.add(result_frame, vignette)
             out.write(result_frame)
