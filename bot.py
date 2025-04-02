@@ -108,26 +108,23 @@ async def process_video_with_peephole_effect(input_path):
     face_cascade = None
     cascade_path_to_try = cascade_filename  # Try local first
 
+    # Find Haar cascade file
     if not os.path.exists(cascade_path_to_try):
-        # Try standard cv2 path if local fails
         cv2_data_path = getattr(cv2, "data", None)
-        if (
-            cv2_data_path
-            and cv2_data_path.haarcascades
-            and os.path.exists(
-                os.path.join(cv2_data_path.haarcascades, cascade_filename)
-            )
+        haarcascades_path = (
+            getattr(cv2_data_path, "haarcascades", None) if cv2_data_path else None
+        )
+        if haarcascades_path and os.path.exists(
+            os.path.join(haarcascades_path, cascade_filename)
         ):
-            cascade_path_to_try = os.path.join(
-                cv2_data_path.haarcascades, cascade_filename
-            )
+            cascade_path_to_try = os.path.join(haarcascades_path, cascade_filename)
             logging.info(
                 f"Using cascade file found in cv2 data path: {cascade_path_to_try}"
             )
         else:
             cascade_path_to_try = None
             logging.warning(
-                f"Could not find '{cascade_filename}' locally or in cv2 data path. Face detection disabled."
+                f"Could not find '{cascade_filename}'. Face detection disabled."
             )
 
     if cascade_path_to_try:
@@ -158,32 +155,62 @@ async def process_video_with_peephole_effect(input_path):
                 f"Video frame width ({width}) or height ({height}) is invalid."
             )
 
-        # Original frame dimensions (square for video notes)
+        # Use the smaller dimension for square processing
         orig_size = min(width, height)
+        center_x = orig_size / 2.0
+        center_y = orig_size / 2.0
+        max_radius = orig_size / 2.0
+        epsilon = 1e-6
 
-        # Expand factor - how much we'll initially enlarge the frame
-        # to compensate for shrinking during lens effect
-        expand_factor = 1.25  # 25% expansion (increased to ensure no borders)
+        # --- Calibration Phase ---
+        calibration_frames = 10
+        initial_face_widths = []
+        frames_read_for_calib = 0
+        logging.info(f"Starting calibration phase ({calibration_frames} frames)...")
+        while frames_read_for_calib < calibration_frames:
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning("Could not read enough frames for calibration.")
+                break
+            frames_read_for_calib += 1
 
-        # Calculate expanded frame size
-        expanded_size = int(orig_size * expand_factor)
+            # Ensure frame is square and right size
+            if frame.shape[0] != frame.shape[1] or frame.shape[0] != orig_size:
+                if frame.shape[0] != frame.shape[1]:
+                    min_dim = min(frame.shape[0], frame.shape[1])
+                    start_y = (frame.shape[0] - min_dim) // 2
+                    start_x = (frame.shape[1] - min_dim) // 2
+                    frame = frame[
+                        start_y : start_y + min_dim, start_x : start_x + min_dim
+                    ]
+                if frame.shape[0] != orig_size:
+                    frame = cv2.resize(frame, (orig_size, orig_size))
 
-        # Ensure expanded size is even (for video codec compatibility)
-        if expanded_size % 2 != 0:
-            expanded_size += 1
+            if face_cascade:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.equalizeHist(gray)
+                faces = face_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+                )
+                if len(faces) > 0:
+                    largest_face = max(faces, key=lambda item: item[2] * item[3])
+                    initial_face_widths.append(largest_face[2])  # Store width (fw)
 
-        # Centers for original and expanded
-        center_orig_x = orig_size / 2.0
-        center_orig_y = orig_size / 2.0
-        center_expanded_x = expanded_size / 2.0
-        center_expanded_y = expanded_size / 2.0
+        initial_face_width_avg = (
+            np.mean(initial_face_widths) if initial_face_widths else orig_size * 0.2
+        )  # Default if no face found
+        logging.info(
+            f"Calibration complete. Average initial face width: {initial_face_width_avg:.2f} (from {len(initial_face_widths)} detections)"
+        )
 
-        # Radius calculations
-        max_radius_orig = orig_size / 2.0
-        max_radius_expanded = expanded_size / 2.0
+        # Reset video capture to start processing from the beginning
+        cap.release()
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise IOError(f"Cannot re-open video file {input_path} after calibration")
 
         # Video writer setup
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Use H.264 if possible
         out = cv2.VideoWriter(temp_output_path, fourcc, fps, (orig_size, orig_size))
         if not out.isOpened():
             logging.warning("avc1 codec not available, falling back to mp4v.")
@@ -193,76 +220,46 @@ async def process_video_with_peephole_effect(input_path):
                 cap.release()
                 raise IOError(f"Cannot open video writer for {temp_output_path}")
 
-        # --- Set up masks for original size ---
-        # Create circular mask for the original size
+        # --- Precompute masks and coordinates ---
+        # Circular mask
         circle_mask_orig = np.zeros((orig_size, orig_size), dtype=np.uint8)
         cv2.circle(
-            circle_mask_orig,
-            (int(center_orig_x), int(center_orig_y)),
-            int(max_radius_orig),
-            255,
-            -1,
+            circle_mask_orig, (int(center_x), int(center_y)), int(max_radius), 255, -1
         )
         inv_circle_mask_orig = cv2.bitwise_not(circle_mask_orig)
 
-        # Create expanded circular mask (larger than needed to ensure no borders)
-        circle_mask_expanded = np.zeros((expanded_size, expanded_size), dtype=np.uint8)
-        cv2.circle(
-            circle_mask_expanded,
-            (int(center_expanded_x), int(center_expanded_y)),
-            int(max_radius_expanded),
-            255,
-            -1,
-        )
-
-        # --- Create vignette mask ---
+        # Vignette mask
         vignette_mask = np.zeros((orig_size, orig_size), dtype=np.float32)
         cv2.circle(
-            vignette_mask,
-            (int(center_orig_x), int(center_orig_y)),
-            int(max_radius_orig),
-            1.0,
-            -1,
+            vignette_mask, (int(center_x), int(center_y)), int(max_radius), 1.0, -1
         )
         blur_ksize_val = max(1, orig_size // 10)
         blur_ksize = blur_ksize_val + 1 if blur_ksize_val % 2 == 0 else blur_ksize_val
         vignette_mask = cv2.GaussianBlur(vignette_mask, (blur_ksize, blur_ksize), 0)
         vignette_mask_3ch = cv2.cvtColor(vignette_mask, cv2.COLOR_GRAY2BGR)
 
-        # --- Create edge stretch maps (larger size) ---
-        x_expanded, y_expanded = np.meshgrid(
-            np.arange(expanded_size, dtype=np.float32),
-            np.arange(expanded_size, dtype=np.float32),
+        # Coordinate grids and radius/angle (only need to compute once)
+        x_coords, y_coords = np.meshgrid(
+            np.arange(orig_size, dtype=np.float32),
+            np.arange(orig_size, dtype=np.float32),
         )
-
-        # Calculate distances from center
-        dx_expanded = x_expanded - center_expanded_x
-        dy_expanded = y_expanded - center_expanded_y
-        r_expanded = np.sqrt(dx_expanded**2 + dy_expanded**2)
-        theta_expanded = np.arctan2(dy_expanded, dx_expanded)
-
-        # Normalize distances (0 at center, 1 at max radius)
-        r_norm_expanded = np.minimum(1.0, r_expanded / max_radius_expanded)
-
-        # Create edge stretching map
-        # Higher stretch factor means more aggressive stretching at edges
-        edge_stretch = 0.25  # Increased for better compensation
-
-        # Stretch increases quadratically from center to edges
-        stretch_factor = 1.0 + edge_stretch * (r_norm_expanded**2)
-
-        # Apply outward stretch
-        stretch_map_x = center_expanded_x + dx_expanded * stretch_factor
-        stretch_map_y = center_expanded_y + dy_expanded * stretch_factor
+        dx = x_coords - center_x
+        dy = y_coords - center_y
+        r_pixels = np.sqrt(dx**2 + dy**2)
+        theta = np.arctan2(dy, dx)
+        r_norm = np.minimum(1.0, r_pixels / max_radius)  # Normalized radius (0 to 1)
 
         # Background for final output
         background = np.zeros((orig_size, orig_size, 3), dtype=np.uint8)
         background.fill(20)  # Dark gray background
 
-        # For face detection tracking
+        # --- Processing State ---
         frame_counter = 0
-        last_known_good_strength = 0.0
-        epsilon = 1e-6
+        smoothed_strength = 0.0
+        last_valid_target_strength = 0.0
+        alpha = 0.15  # Smoothing factor (lower = smoother)
+        scale_factor = 0.9  # How much face size ratio affects strength
+        max_strength_cap = 0.9  # Max distortion strength
 
         logging.info("Starting frame processing loop...")
         while True:
@@ -278,7 +275,6 @@ async def process_video_with_peephole_effect(input_path):
 
             # --- Ensure frame is square and right size ---
             if frame.shape[0] != frame.shape[1] or frame.shape[0] != orig_size:
-                # Center crop to square if needed
                 if frame.shape[0] != frame.shape[1]:
                     min_dim = min(frame.shape[0], frame.shape[1])
                     start_y = (frame.shape[0] - min_dim) // 2
@@ -286,161 +282,121 @@ async def process_video_with_peephole_effect(input_path):
                     frame = frame[
                         start_y : start_y + min_dim, start_x : start_x + min_dim
                     ]
-
-                # Resize to orig_size if needed
                 if frame.shape[0] != orig_size:
                     frame = cv2.resize(frame, (orig_size, orig_size))
 
-            # --- Calculate lens strength based on face detection ---
-            dynamic_lens_strength = 0.0
+            # --- Calculate target lens strength based on face detection ---
+            target_strength = last_valid_target_strength  # Start with previous value
             face_detected_this_frame = False
 
-            if face_cascade:
-                # Extract just the circular area for face detection
-                circular_area = cv2.bitwise_and(frame, frame, mask=circle_mask_orig)
-                gray = cv2.cvtColor(circular_area, cv2.COLOR_BGR2GRAY)
-                gray = cv2.equalizeHist(gray)
-
+            if face_cascade and initial_face_width_avg > epsilon:
+                # Detect in the full frame (or could mask first)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.equalizeHist(gray)  # Helps with varying lighting
                 faces = face_cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
                 )
 
                 if len(faces) > 0:
                     largest_face = max(faces, key=lambda item: item[2] * item[3])
-                    fx, fy, fw, fh = largest_face
-                    relative_width = fw / orig_size
-                    min_face_ratio = 0.08
-                    max_face_ratio = 0.5
-                    max_strength = 0.35
+                    current_face_width = largest_face[2]
+                    face_ratio = current_face_width / initial_face_width_avg
 
-                    current_strength = 0.0
-                    if relative_width < min_face_ratio:
-                        current_strength = 0.0
-                    elif relative_width > max_face_ratio:
-                        current_strength = max_strength
-                    else:
-                        progress = (relative_width - min_face_ratio) / (
-                            max_face_ratio - min_face_ratio
-                        )
-                        current_strength = max_strength * progress
+                    # Map ratio to strength: ratio > 1 (closer) -> positive strength
+                    # Ratio = 1 -> strength = 0
+                    current_target = max(0, (face_ratio - 1.0)) * scale_factor
+                    target_strength = min(
+                        current_target, max_strength_cap
+                    )  # Cap strength
 
-                    dynamic_lens_strength = current_strength
-                    last_known_good_strength = current_strength
+                    last_valid_target_strength = (
+                        target_strength  # Update last known good target
+                    )
                     face_detected_this_frame = True
-                else:
-                    dynamic_lens_strength = last_known_good_strength
-                    face_detected_this_frame = False
-            else:
-                dynamic_lens_strength = 0.0
-                face_detected_this_frame = False
+                # else: target_strength remains last_valid_target_strength
 
-            # --- Extract circular area and expand it ---
-            # Extract only the circular area from the original frame
-            circular_area = cv2.bitwise_and(frame, frame, mask=circle_mask_orig)
+            # --- Smooth the strength ---
+            smoothed_strength = (
+                alpha * target_strength + (1.0 - alpha) * smoothed_strength
+            )
 
-            # Create expanded canvas (black background)
-            expanded_frame = np.zeros((expanded_size, expanded_size, 3), dtype=np.uint8)
+            # --- Calculate Remap Coordinates ---
+            # Distortion is strongest at center, falls off quadratically
+            # Positive strength means magnification (pulling pixels from further out)
+            distortion_effect = smoothed_strength * (1.0 - r_norm**2)
 
-            # Place the circular area in the center of expanded canvas
-            # Calculate offsets for placing original in center of expanded
-            offset_y = (expanded_size - orig_size) // 2
-            offset_x = (expanded_size - orig_size) // 2
+            # Scale factor for coordinates: > 1 means sample further out (magnify)
+            # Scale = 1 / (1 - distortion) -- adjusted formula
+            # Let's use scale = 1.0 + distortion. s > 0 -> scale > 1 -> magnify
+            scale = 1.0 + distortion_effect
+            scale = np.maximum(
+                scale, epsilon
+            )  # Avoid division by zero or negative scale
 
-            # Copy the circular area to expanded frame
-            expanded_frame[
-                offset_y : offset_y + orig_size, offset_x : offset_x + orig_size
-            ] = circular_area
+            # Calculate source coordinates for each destination pixel
+            # map_x[dest_y, dest_x] = source_x
+            # map_y[dest_y, dest_x] = source_y
+            # Source coordinate = center + (dest_coord - center) / scale
+            # map_x = center_x + dx / scale # Old incorrect way
+            # Correct: We want source coords, so if dest = center + R*vec, src = center + R*scale*vec? No.
+            # If scale > 1, need to sample from a larger radius.
+            # Let's try source_radius = pixel_radius / scale.
+            # Then source_x = center + source_radius * cos(theta) = center + (r_pixels / scale) * (dx / r_pixels) = center + dx / scale
+            # Hmm, this is the inverse mapping. Let's stick to the formula from prev attempt that worked conceptually:
+            # map_x = center_x + dx / (1.0 + distortion_effect) # This was likely correct inverse mapping
 
-            # --- Apply edge stretching to expanded frame ---
-            stretched_frame = cv2.remap(
-                expanded_frame,
-                stretch_map_x,
-                stretch_map_y,
+            # Trying the direct mapping: map the source grid to destination grid
+            # new_radius = r_pixels * (1.0 + distortion_effect) # Incorrect conceptual model
+            # Let's use the inverse mapping: Find where each *destination* pixel should sample from
+
+            map_x = center_x + dx / scale
+            map_y = center_y + dy / scale
+
+            # Convert maps to float32
+            map_x = map_x.astype(np.float32)
+            map_y = map_y.astype(np.float32)
+
+            # --- Apply Remapping (Lens Effect) ---
+            distorted_frame = cv2.remap(
+                frame,
+                map_x,
+                map_y,
                 interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
+                borderMode=cv2.BORDER_CONSTANT,  # Use black borders for out-of-bounds
                 borderValue=(0, 0, 0),
             )
 
-            # --- Apply dynamic lens effect ---
-            if dynamic_lens_strength > epsilon:
-                # Create magnification map that's strongest in center
-                dynamic_magnification = 1.0 + dynamic_lens_strength * (
-                    1.0 - r_norm_expanded**2
-                )
-                dynamic_magnification = np.maximum(dynamic_magnification, epsilon)
-
-                # Calculate source coordinates with inverse mapping
-                src_x = center_expanded_x + dx_expanded / dynamic_magnification
-                src_y = center_expanded_y + dy_expanded / dynamic_magnification
-
-                # Apply lens effect
-                magnified_frame = cv2.remap(
-                    stretched_frame,
-                    src_x.astype(np.float32),
-                    src_y.astype(np.float32),
-                    interpolation=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0),
-                )
-            else:
-                # No magnification
-                magnified_frame = stretched_frame
-
-            # --- Crop back to original size from center ---
-            crop_start_y = offset_y
-            crop_start_x = offset_x
-            crop_end_y = crop_start_y + orig_size
-            crop_end_x = crop_start_x + orig_size
-
-            result_frame = magnified_frame[
-                crop_start_y:crop_end_y, crop_start_x:crop_end_x
-            ]
-
             # --- Apply circular mask and vignette ---
-            # Re-apply circular mask to ensure clean edges
+            # Mask the remapped frame to keep it circular
             masked_result = cv2.bitwise_and(
-                result_frame, result_frame, mask=circle_mask_orig
+                distorted_frame, distorted_frame, mask=circle_mask_orig
             )
 
-            # Apply vignette effect
+            # Apply vignette
             vignetted_float = cv2.multiply(
                 masked_result.astype(np.float32), vignette_mask_3ch, dtype=cv2.CV_32F
             )
             vignetted_frame = np.clip(vignetted_float, 0, 255).astype(np.uint8)
 
-            # Combine with background
+            # --- Combine with background ---
+            # Get the background part outside the circle
             background_part = cv2.bitwise_and(
                 background, background, mask=inv_circle_mask_orig
             )
+            # Add the vignetted circular video on top
             final_result = cv2.add(background_part, vignetted_frame)
 
-            # --- Add lens strength debug value ---
-            debug_text = f"{dynamic_lens_strength:.3f}"
-            font_scale = 0.5
-            thickness = 1
-            (text_width, text_height), baseline = cv2.getTextSize(
-                debug_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-            )
-            text_x = int(center_orig_x - text_width / 2)
-            text_y = int(center_orig_y + text_height / 2)
-            cv2.putText(
-                final_result,
-                debug_text,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (220, 220, 220),
-                thickness,
-                cv2.LINE_AA,
-            )
+            # --- REMOVED DEBUG TEXT ---
 
             # Write frame
             out.write(final_result)
 
+        # --- Cleanup ---
         cap.release()
         out.release()
         logging.info("OpenCV processing finished.")
 
+        # --- FFmpeg for audio and final encoding ---
         logging.info("Starting FFmpeg merging/re-encoding...")
         final_output_file = None
         try:
