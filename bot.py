@@ -256,10 +256,59 @@ async def process_video_with_peephole_effect(input_path):
         # --- Processing State ---
         frame_counter = 0
         smoothed_strength = 0.0
-        last_valid_target_strength = 0.0
+        last_valid_target_strength = (
+            0.0  # Store the last strength calculated when face WAS detected
+        )
         alpha = 0.15  # Smoothing factor (lower = smoother)
-        scale_factor = 0.9  # How much face size ratio affects strength
-        max_strength_cap = 0.9  # Max distortion strength
+        alpha_decay = 0.03  # Slower decay when face is lost
+        scale_factor = 0.9  # How much face size ratio affects strength (user adjusted)
+        max_strength_cap = 0.9  # Max distortion strength (user adjusted)
+
+        # --- Precompute Static Edge Compression Map ---
+        logging.info("Precomputing static edge compression map...")
+        map_x_edge = np.zeros((orig_size, orig_size), np.float32)
+        map_y_edge = np.zeros((orig_size, orig_size), np.float32)
+        edge_center_radius_ratio = 0.6  # Preserve center 60% exactly
+        edge_center_radius = orig_size * edge_center_radius_ratio
+        edge_strength_factor = 0.3  # Strength of edge compression (REDUCED from 0.3)
+
+        # Use precomputed coordinate grids (dx, dy, r_pixels, theta)
+        for y in range(orig_size):
+            for x in range(orig_size):
+                current_r = r_pixels[y, x]
+                current_theta = theta[y, x]
+
+                if current_r <= edge_center_radius:
+                    # Inside central radius, map identity
+                    map_x_edge[y, x] = float(x)
+                    map_y_edge[y, x] = float(y)
+                else:
+                    # Outside central radius, apply compression
+                    # Calculate normalized position within the outer ring (0 to 1)
+                    edge_t = (current_r - edge_center_radius) / (
+                        max_radius - edge_center_radius
+                    )
+                    edge_t = np.clip(edge_t, 0.0, 1.0)
+
+                    # Compression strength increases towards the edge (cubic)
+                    compression = edge_strength_factor * edge_t**3
+
+                    # Calculate new radius (pulls pixels towards center)
+                    # The factor (1.0 - compression * edge_t) was used in example, let's try that first
+                    # Refined: Simpler compression: r_new = r * (1 - compression) ?
+                    # Let's use the example logic: r_new = r * (1 - factor * t**4ish)
+                    r_new = current_r * (
+                        1.0 - compression * edge_t
+                    )  # Match example logic
+
+                    # Convert back to cartesian coordinates
+                    new_x = center_x + r_new * np.cos(current_theta)
+                    new_y = center_y + r_new * np.sin(current_theta)
+
+                    # Inverse mapping: where should pixel (x, y) sample from?
+                    map_x_edge[y, x] = new_x
+                    map_y_edge[y, x] = new_y
+        logging.info("Edge compression map computed.")
 
         logging.info("Starting frame processing loop...")
         while True:
@@ -313,14 +362,17 @@ async def process_video_with_peephole_effect(input_path):
                         target_strength  # Update last known good target
                     )
                     face_detected_this_frame = True
-                # else: target_strength remains last_valid_target_strength
+                # else: if no face, target_strength remains last_valid_target_strength
 
             # --- Smooth the strength ---
+            # Use faster smoothing if face is detected, slower decay if not
+            current_alpha = alpha if face_detected_this_frame else alpha_decay
             smoothed_strength = (
-                alpha * target_strength + (1.0 - alpha) * smoothed_strength
+                current_alpha * target_strength
+                + (1.0 - current_alpha) * smoothed_strength
             )
 
-            # --- Calculate Remap Coordinates ---
+            # --- Calculate Dynamic Remap Coordinates (Face size based) ---
             # Distortion is strongest at center, falls off quadratically
             # Positive strength means magnification (pulling pixels from further out)
             distortion_effect = smoothed_strength * (1.0 - r_norm**2)
@@ -356,7 +408,7 @@ async def process_video_with_peephole_effect(input_path):
             map_x = map_x.astype(np.float32)
             map_y = map_y.astype(np.float32)
 
-            # --- Apply Remapping (Lens Effect) ---
+            # --- Apply Dynamic Remapping (Lens Effect based on Face Size) ---
             distorted_frame = cv2.remap(
                 frame,
                 map_x,
@@ -366,10 +418,20 @@ async def process_video_with_peephole_effect(input_path):
                 borderValue=(0, 0, 0),
             )
 
+            # --- Apply Static Edge Compression Remapping ---
+            edge_compressed_frame = cv2.remap(
+                distorted_frame,  # Apply to the result of the first remap
+                map_x_edge,
+                map_y_edge,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,  # Fill edges created by compression with black
+                borderValue=(0, 0, 0),
+            )
+
             # --- Apply circular mask and vignette ---
-            # Mask the remapped frame to keep it circular
+            # Mask the final remapped frame to keep it circular
             masked_result = cv2.bitwise_and(
-                distorted_frame, distorted_frame, mask=circle_mask_orig
+                edge_compressed_frame, edge_compressed_frame, mask=circle_mask_orig
             )
 
             # Apply vignette
