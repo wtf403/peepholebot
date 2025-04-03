@@ -204,15 +204,13 @@ async def process_video_with_peephole_effect(input_path):
         if not cap.isOpened():
             raise IOError(f"Cannot re-open video file {input_path} after calibration")
 
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-        out = cv2.VideoWriter(temp_output_path, fourcc, fps, (orig_size, orig_size))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(
+            temp_output_path, fourcc, fps, (orig_size, orig_size), isColor=True
+        )
         if not out.isOpened():
-            logging.warning("avc1 codec not available, falling back to mp4v.")
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(temp_output_path, fourcc, fps, (orig_size, orig_size))
-            if not out.isOpened():
-                cap.release()
-                raise IOError(f"Cannot open video writer for {temp_output_path}")
+            cap.release()
+            raise IOError(f"Cannot open video writer for {temp_output_path}")
 
         circle_mask_orig = np.zeros((orig_size, orig_size), dtype=np.uint8)
         cv2.circle(
@@ -392,29 +390,27 @@ async def process_video_with_peephole_effect(input_path):
                 "-y",
                 "-i",
                 temp_output_path,
-                "-i",
-                input_path,
                 "-c:v",
                 "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "18",
+                "-profile:v",
+                "baseline",
+                "-level",
+                "3.0",
                 "-pix_fmt",
                 "yuv420p",
                 "-vf",
-                f"scale='trunc(iw/2)*2':'trunc(ih/2)*2',format=pix_fmts=yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0?",
+                "scale=640:640,format=yuv420p",
+                "-crf",
+                "23",
+                "-maxrate",
+                "1M",
+                "-bufsize",
+                "2M",
                 "-movflags",
                 "+faststart",
-                "-shortest",
+                "-preset",
+                "medium",
+                "-an",
                 output_path,
             ]
             logging.debug(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
