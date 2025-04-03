@@ -30,10 +30,9 @@ jobs:
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='venv/' \
-            --exclude='service.err.log' \
-            --exclude='service.out.log' \
+            --exclude='.env' \
             . ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/peepholebot
 
       - name: Reload service
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'sudo systemctl restart peepholebot.service'
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'docker restart peepholebot'
