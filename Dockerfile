@@ -21,7 +21,3 @@ RUN python3 -m venv /opt/venv && \
     /bin/bash -c "source /opt/venv/bin/activate && pip install --no-cache-dir -r requirements.txt"
 
 COPY . .
-
-ENTRYPOINT [""]
-
-CMD ["/opt/venv/bin/python", "bot.py"]
